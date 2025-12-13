@@ -124,6 +124,26 @@ class HedgedCopulaPairsTrading(QCAlgorithm):
         self.s1_window = deque(maxlen=self.window_size)
         self.s2_window = deque(maxlen=self.window_size)
 
+        # --- Risk Controls: Volatility Targeting + Drawdown De-risking ---
+        # Goal: scale gross exposure so realized portfolio volatility tracks target.
+        # Implemented in pure Python (no numpy).
+        self.target_ann_vol = 0.10          # 10% annualized target volatility
+        self.vol_lookback = 30              # rolling daily returns window
+        self.min_risk_mult = 0.20           # never go below 20% of baseline exposure
+        self.max_risk_mult = 1.00           # cap at baseline exposure (0.5 / -0.5 per leg)
+        self.vol_spike_ann = 0.25           # if realized ann vol > 25%, force de-risk
+
+        self.dd_trigger = 0.10              # 10% drawdown triggers de-risk
+        self.dd_recover = 0.05              # recover when drawdown < 5%
+        self.derisk_cap = 0.30              # cap risk multiplier to 0.30 under stress
+
+        self._port_ret_window = deque(maxlen=self.vol_lookback)
+        self._last_port_value = None
+        self._high_water_mark = None
+        self._is_derisk = False
+        self.current_risk_mult = 1.0
+        self._last_risk_log_date = None
+
         # Track active hedge legs to avoid iterating Portfolio (can crash under pythonnet)
         self.active_put = None
         self.active_call = None
@@ -131,10 +151,105 @@ class HedgedCopulaPairsTrading(QCAlgorithm):
 
         self.SetWarmUp(self.window_size)
 
+    @staticmethod
+    def _stdev(values):
+        n = len(values)
+        if n < 2:
+            return 0.0
+        mean = sum(values) / float(n)
+        var = 0.0
+        for v in values:
+            dv = v - mean
+            var += dv * dv
+        var /= float(n - 1)
+        return math.sqrt(var)
+
+    @staticmethod
+    def _clamp(v, lo, hi):
+        if v < lo:
+            return lo
+        if v > hi:
+            return hi
+        return v
+
+    def _update_risk_multiplier(self):
+        """Update self.current_risk_mult using rolling portfolio returns + drawdown overlay."""
+        tpv = float(self.Portfolio.TotalPortfolioValue)
+        if self._high_water_mark is None:
+            self._high_water_mark = tpv
+        if tpv > self._high_water_mark:
+            self._high_water_mark = tpv
+
+        # Update rolling portfolio returns (based on total equity changes)
+        if self._last_port_value is not None and self._last_port_value > 0:
+            r = (tpv / float(self._last_port_value)) - 1.0
+            if math.isfinite(r):
+                self._port_ret_window.append(float(r))
+        self._last_port_value = tpv
+
+        # Estimate realized vol
+        realized_daily = self._stdev(list(self._port_ret_window))
+        realized_ann = realized_daily * math.sqrt(252.0)
+        target_daily = float(self.target_ann_vol) / math.sqrt(252.0)
+
+        risk_mult = 1.0
+        if realized_daily > 1e-12:
+            risk_mult = target_daily / realized_daily
+
+        risk_mult = self._clamp(risk_mult, self.min_risk_mult, self.max_risk_mult)
+
+        # Drawdown / vol-spike overlay (cap risk)
+        dd = 0.0
+        if self._high_water_mark and self._high_water_mark > 0:
+            dd = 1.0 - (tpv / float(self._high_water_mark))
+
+        stress = (dd >= self.dd_trigger) or (realized_ann >= self.vol_spike_ann)
+        if stress:
+            self._is_derisk = True
+        else:
+            # hysteresis to avoid toggling
+            recover = (dd <= self.dd_recover) and (realized_ann <= (0.90 * self.vol_spike_ann))
+            if self._is_derisk and recover:
+                self._is_derisk = False
+
+        if self._is_derisk:
+            risk_mult = min(risk_mult, float(self.derisk_cap))
+
+        self.current_risk_mult = float(risk_mult)
+
+        # Low-noise daily logging
+        today = self.Time.date()
+        if self._last_risk_log_date != today:
+            state = "DERISK" if self._is_derisk else "NORMAL"
+            self.Debug(
+                f"[RISK] {today} state={state} mult={self.current_risk_mult:.3f} dd={dd:.3%} vol_ann={realized_ann:.2%}"
+            )
+            self._last_risk_log_date = today
+
+    def _rebalance_pair_to_risk_target(self):
+        """Rebalance existing pair holdings to sign*(0.5*risk_mult) without flipping direction."""
+        if not (self.Portfolio[self.s1].Invested or self.Portfolio[self.s2].Invested):
+            return
+
+        w = 0.5 * float(self.current_risk_mult)
+        # Keep the current direction on each leg.
+        if self.Portfolio[self.s1].IsLong:
+            self.SetHoldings(self.s1, +w)
+        elif self.Portfolio[self.s1].IsShort:
+            self.SetHoldings(self.s1, -w)
+
+        if self.Portfolio[self.s2].IsLong:
+            self.SetHoldings(self.s2, +w)
+        elif self.Portfolio[self.s2].IsShort:
+            self.SetHoldings(self.s2, -w)
+
     def OnData(self, data: Slice):
         # ------------------------------------------------
         # 1. Update Data & Copula Logic
         # ------------------------------------------------
+        # Update risk scaling (uses equity curve; safe even when not invested)
+        self._update_risk_multiplier()
+
         if data.ContainsKey(self.s1) and data[self.s1] is not None:
             self.s1_window.append(float(data[self.s1].Close))
         if data.ContainsKey(self.s2) and data[self.s2] is not None:
@@ -199,15 +314,20 @@ class HedgedCopulaPairsTrading(QCAlgorithm):
         if not self.Portfolio.Invested:
             if mispricing_prob < self.floor_threshold:
                 # Long S1, Short S2
-                self.SetHoldings(self.s1, 0.5)
-                self.SetHoldings(self.s2, -0.5)
+                w = 0.5 * float(self.current_risk_mult)
+                self.SetHoldings(self.s1, +w)
+                self.SetHoldings(self.s2, -w)
             elif mispricing_prob > self.cap_threshold:
                 # Short S1, Long S2
-                self.SetHoldings(self.s1, -0.5)
-                self.SetHoldings(self.s2, 0.5)
+                w = 0.5 * float(self.current_risk_mult)
+                self.SetHoldings(self.s1, -w)
+                self.SetHoldings(self.s2, +w)
 
         # Exit Logic
         else:
+            # Keep exposure aligned with risk target while invested
+            self._rebalance_pair_to_risk_target()
+
             # Mean Reversion Exit
             if (0.5 - self.exit_tolerance) < mispricing_prob < (0.5 + self.exit_tolerance):
                 self.Liquidate() # Liquidates stocks and options
