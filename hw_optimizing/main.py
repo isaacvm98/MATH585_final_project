@@ -502,8 +502,8 @@ class HedgedCopulaPairsTrading(QCAlgorithm):
 
         # --- Strategy Weight Allocation ---
         # Adjust these weights to balance between strategies
-        self.momentum_weight = 0.5  # 30% to momentum strategy
-        self.pairs_weight = 0.5     # 70% to pairs trading (split among pairs)
+        self.momentum_weight = 0.75  # 30% to momentum strategy
+        self.pairs_weight = 1     # 70% to pairs trading (split among pairs)
         
         # --- Momentum Strategy Setup ---
         # Dual Confirmation: ROC(252) + SMA(200)
