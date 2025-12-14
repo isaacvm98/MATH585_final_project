@@ -478,7 +478,7 @@ class HedgedCopulaPairsTrading(QCAlgorithm):
     """Main algorithm managing multiple copula pairs."""
 
     def Initialize(self):
-        self.SetStartDate(2018, 1, 1)
+        self.SetStartDate(2019, 1, 1)
         self.SetEndDate(2026, 9, 1)
         self.SetCash(100000)
 
